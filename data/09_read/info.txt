@@ -1,0 +1,2 @@
+input: str(x)
+output: [x]

@@ -1,0 +1,2 @@
+input: nothing
+output: [2022]

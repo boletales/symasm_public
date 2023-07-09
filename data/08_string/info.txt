@@ -1,0 +1,2 @@
+input: s
+output: s

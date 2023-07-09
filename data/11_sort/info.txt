@@ -1,0 +1,2 @@
+input: [x_1, ..., x_n].map(str).join(" ")
+output: [x_1, ..., x_n].sorted().map(str).join(" ")

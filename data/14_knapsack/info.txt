@@ -1,0 +1,15 @@
+input:
+    [str(n), str(c)].join(" ") + "\n" +
+    [[str(v_1),str(w_1)].join(" "),
+      ...
+     [str(w_n),str(v_n)].join(" ")].join("\n")
+  where
+    1. ∀i∈{1,...,n}. 0≦w_i ∧ 0≦v_i
+
+output: 
+    str(vmax)
+  where
+    1. vmax := [v_(s_1), ... ,v_(s_m)].sum()
+    2. [w_(s_1), ... ,w_(s_m)].sum()≦c
+    3. ∀i,j∈{1,...,m}. 1≦s_i,s_j≦n ∧ (s_i==s_j)⇒(i==j)
+    4. maximize vmax

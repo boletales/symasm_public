@@ -1,0 +1,2 @@
+input: [x_1, x_2]
+output: [x_1 + x_2]

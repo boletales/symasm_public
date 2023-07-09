@@ -1,0 +1,16 @@
+input:
+    [str(t), str(r), str(s), str(g)].join(" ") + "\n" + 
+    [[str(o_1),str(d_1),str(c_1)].join(" "), 
+      ...
+     [str(o_m),str(d_m),str(c_m)].join(" ")].join("\n")
+  where
+    1. n≦100, m≦400
+    2. ∀i∈{1,...,m}. (0≦o_i<n ∧ 0≦d_i<n ∧ 0≦c)
+
+output: 
+    str(cmin)
+  where 
+    1. cmin := [c_(p_1), ... ,c_(p_n)].sum()
+    2. o_(p_1)==s, d_(p_n)==g
+    3. ∀i∈{1,...,n-1}. d_(p_(i+1))==o_(p_i)
+    4. minimize cmin

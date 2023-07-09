@@ -1,0 +1,1282 @@
+module Macro where
+
+import Control.Monad.Except.Trans
+import Control.Monad.Reader
+import Control.Monad.Reader.Trans
+import Control.Monad.State
+import Control.Monad.State.Trans
+import Control.Monad.Writer
+import Data.Array
+import Data.Bifunctor
+import Data.Bounded.Generic
+import Data.Either
+import Data.Enum
+import Data.Enum.Generic
+import Data.Eq.Generic
+import Data.Functor
+import Data.Generic.Rep
+import Data.Int
+import Data.Int.Bits
+import Data.Maybe
+import Data.Ord.Generic
+import Data.Show.Generic
+import Data.Tuple
+import Data.Tuple.Nested
+import Data.Unfoldable
+import Debug
+import Main
+import Node.Encoding
+import Node.FS.Sync
+import Prelude
+import Prim.RowList
+import Type.Proxy
+import Unsafe.Coerce
+import Data.Newtype hiding (modify)
+
+import Control.Monad.Reader (ReaderT(..), ask, runReaderT)
+import Data.Char.Utils (fromCodePoint)
+import Data.Function (applyN)
+import Data.Identity (Identity(..))
+import Data.Map (values)
+import Data.Map as Mp
+import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Newtype (overF)
+import Data.Set as Se
+import Data.String (codePointFromChar, joinWith)
+import Data.String as St
+import Data.String.CodePoints as St
+import Data.String.Common as St
+import Data.String.Pattern as St
+
+import Data.Traversable (sequence, traverse)
+import Data.Tuple.Nested (Tuple2)
+import Effect (Effect)
+import Effect.Class.Console (logShow)
+import Effect.Console (log)
+
+addr = Addr <<< Val
+ptr  = Ptr  <<< Val
+
+data MemLayer = Stack | Heap
+derive instance genericMemLayer :: Generic MemLayer _
+instance eqMemLayer :: Eq MemLayer where
+  eq = genericEq
+instance ordMemLayer :: Ord MemLayer where
+  compare = genericCompare
+instance enumMemLayer :: Enum MemLayer where
+  succ = genericSucc
+  pred = genericPred
+instance boundedMemLayer :: Bounded MemLayer where
+  top = genericTop
+  bottom = genericBottom
+instance boundedEnumMemLayer :: BoundedEnum MemLayer where
+  cardinality = genericCardinality
+  toEnum = genericToEnum
+  fromEnum = genericFromEnum
+
+
+data VType = SimpleInt
+derive instance genericVType :: Generic VType _
+instance eqVType :: Eq VType where
+  eq = genericEq
+instance ordVType :: Ord VType where
+  compare = genericCompare
+instance enumVType :: Enum VType where
+  succ = genericSucc
+  pred = genericPred
+instance boundedVType :: Bounded VType where
+  top = genericTop
+  bottom = genericBottom
+instance boundedEnumVType :: BoundedEnum VType where
+  cardinality = genericCardinality
+  toEnum = genericToEnum
+  fromEnum = genericFromEnum
+
+realAddrPC   = 0
+realAddrTrash  = 1
+realAddrRegLine  = 2
+realAddrRegSource1 = 3
+realAddrRegSource2 = 4
+realAddrRegDest   = 5
+realAddrRegValue1 = 6
+realAddrRegValue2 = 7
+realAddrFramePointer = 8
+realAddrHeapBlankStart = 9
+realAddrRegLastChar = 10
+realAddrRemoveAtmark1 = 11
+realAddrRemoveAtmark2 = 12
+realAddrRemoveAtmark3 = 13
+memOffset = 20
+
+
+layerNum = (fromEnum $ (top :: MemLayer)) + 1
+calcRealAddrFromLayeredAddr :: MemLayer -> Int -> Int
+calcRealAddrFromLayeredAddr layer addr = memOffset + layerNum * addr + fromEnum layer
+
+type NameSpace = String
+data L1FunctionTag = L1FMain | L1FUser NameSpace Int String
+derive instance genericL1FunctionTag :: Generic L1FunctionTag _
+instance eqL1FunctionTag :: Eq L1FunctionTag where
+  eq = genericEq
+instance ordL1FunctionTag :: Ord L1FunctionTag where
+  compare = genericCompare
+instance showL1FunctionTag :: Show L1FunctionTag where
+  show = genericShow
+
+l1fName ∷ L1FunctionTag → String
+l1fName (L1FMain)        = "[main]"
+l1fName (L1FUser ns i n) = ns <> "." <> n
+
+type FunctionLineMap = Mp.Map L1FunctionTag Int
+data CompileError = 
+  L1NoMain |
+  L1NoFunctionNamed String |
+  L2NoFunctionNamed String |
+  L2NoMain
+derive instance genericCompileError :: Generic CompileError _
+instance showCompileError :: Show CompileError where
+  show = genericShow
+
+
+l1Init :: Int -> Int -> Int -> L1Command
+l1Init globals len entryPoint = l1Fold [
+    asL1 $ ComNop,
+    asL1 $ ComNop,
+    asL1 $ ComSet (addr realAddrHeapBlankStart)     (Val $ calcRealAddrFromLayeredAddr Heap  0),
+    asL1 $ ComSet (addr realAddrFramePointer)       (Val $ calcRealAddrFromLayeredAddr Stack (globals+1)),
+    asL1 $ ComSet (Addr $ ptr realAddrFramePointer) (ptr realAddrFramePointer),
+    l1PushCallStack len 0,
+    asL1 $ ComSet (addr realAddrPC) (Val entryPoint),
+    asL1 $ ComNop
+  ]
+
+type CompilationResult = Array (Tuple Command (Maybe String))
+
+prettyFname :: L1FunctionTag -> String
+prettyFname L1FMain             = "main.main"
+prettyFname (L1FUser ns _ name) = ns <> "." <> name
+compileL1 :: Int -> Mp.Map L1FunctionTag L1Command -> Either CompileError CompilationResult
+compileL1 globals funcs = do
+  let getHeader flmap len = 
+        case Mp.lookup L1FMain flmap of
+          Nothing -> Left L1NoMain
+          Just entryPoint -> mapWithIndex (\i x -> 
+                                Tuple x (
+                                  if       i == 0 then Just ("generated by \"\"\"%@!##!=%")
+                                  else (if i == 1 then Just ("start header")
+                                  else                 Nothing)
+                                )
+                              ) <$> ((l1Init globals len entryPoint) flmap 0)
+  let compile flmap header = 
+        foldM (\(Tuple fmap l0cmds) (Tuple fname l1cmd) -> (
+                  (\c ->
+                    Tuple 
+                      (Mp.insert fname (length l0cmds) fmap) 
+                      (l0cmds 
+                       <> [Tuple ComNop (Just ("start " <> prettyFname fname))]
+                       <> (mapWithIndex (\i x -> Tuple x Nothing) c) 
+                       <> [Tuple ComNop (Just ("end "   <> prettyFname fname))]
+                       <> [Tuple ComNop Nothing])
+                  ) <$> l1cmd fmap (length l0cmds + 1)
+              )) (Tuple flmap (header)) (Mp.toUnfoldable funcs)
+  prerunHeader  <- getHeader (map (const 0) funcs) 0
+  prerun  <- compile (map (const 0) funcs) prerunHeader
+
+  mainrunHeader <- getHeader (fst prerun) (length $ snd prerun)
+  mainrun <- compile (fst prerun) mainrunHeader
+  Right $ snd mainrun
+
+type L1Command = FunctionLineMap -> Int -> Either CompileError (Array Command)
+
+arrAsL1 :: Array Command -> L1Command
+arrAsL1 = const <<< const <<< Right 
+l1Nop ∷ L1Command
+l1Nop = arrAsL1 []
+asL1 :: Command -> L1Command
+asL1 cmd = arrAsL1 [cmd]
+
+l1Fold :: Array L1Command -> L1Command
+l1Fold arr = \f l -> foldM (\cs c -> (cs <> _) <$> c f (l+length cs)) [] arr
+
+
+
+data L1VarId = L1VIG Int | L1VIL Int
+data L1Destination = L1DVar L1VarId | L1DReturn | L1DTrash | L1DAddr Address
+data L1Expression = 
+  L1EVal Value                                                                     |
+  L1EVar L1VarId                                                                   |
+  L1EFun L1FunctionTag (Array L1Expression)                                        |
+  L1EInline0Ary     (Address -> L1Command)                                           |
+  L1EInline1Ary     (Address -> Value -> L1Command) L1Expression                     |
+  L1EInline2Ary     (Address -> Value -> Value -> L1Command) L1Expression L1Expression 
+
+ptrNthGlobalVar ∷ Int → Value
+ptrNthGlobalVar n = ptr $ calcRealAddrFromLayeredAddr Stack n
+valAddrFrame ∷ Value
+valAddrFrame = ptr realAddrFramePointer
+valAddrStackTop ∷ Value
+valAddrStackTop = Ptr $ valAddrFrame
+ptrStackTop ∷ Value
+ptrStackTop = Ptr $ valAddrStackTop
+l1CalcNthLocalArgVarAddrIntoAddr :: Int -> Address -> L1Command
+l1CalcNthLocalArgVarAddrIntoAddr n a = asL1 $ ComAdd a (Val $ layerNum * (n+3)) (ptr realAddrFramePointer)
+
+l1CalcReturnLineIntoAddr :: Address -> L1Command
+l1CalcReturnLineIntoAddr a = arrAsL1 [
+    ComAdd (addr realAddrRegValue1) (Val $ layerNum * 2) (ptr realAddrFramePointer),
+    ComSet a (Ptr $ ptr realAddrRegValue1)
+  ]
+
+--コールスタックの構造:
+--この層の最上部のアドレス  @topstack
+--一個下の最下部のアドレス  @parent
+--処理を戻す行            @returnline
+--引数                  @args...
+--ローカルスタック        @local...  
+l1PushCallStack :: Int -> Int -> L1Command
+l1PushCallStack returnLine lenexps = arrAsL1 $ [
+    ComAdd (addr       realAddrRegDest     ) (    valAddrStackTop     ) (Val layerNum)      , -- regDestに新しい層の最下部のアドレスをセット
+    ComAdd (Addr $ ptr realAddrRegDest     ) (ptr realAddrRegDest     ) (Val $ layerNum * (2 + lenexps)), -- @topstackに新しい層の先頭アドレスをセット
+    ComAdd (addr       realAddrRegDest     ) (ptr realAddrRegDest     ) (Val layerNum)      , -- regDestをインクリメント
+    ComSet (Addr $ ptr realAddrRegDest     ) (ptr realAddrFramePointer)                     , -- @parentに古い層の最下部のアドレスをセット
+    ComAdd (addr       realAddrRegDest     ) (ptr realAddrRegDest     ) (Val layerNum)      , -- regDestをインクリメント
+    ComSet (Addr $ ptr realAddrRegDest     ) (Val returnLine          )                     , -- @returnlineに戻る行をセット
+    ComSub (addr       realAddrFramePointer) (ptr realAddrRegDest     ) (Val $ layerNum * 2)  -- framePointerに新しい層の最下部のアドレスをセット
+  ]
+
+l1PopCallStack :: L1Command
+l1PopCallStack = arrAsL1 $ [
+    ComAdd (addr realAddrRegSource1  ) (ptr realAddrFramePointer) (Val layerNum),
+    ComSet (addr realAddrFramePointer) (Ptr $ ptr realAddrRegSource1)
+  ]
+
+l1PushLocalVar :: Int -> L1Command
+l1PushLocalVar n = arrAsL1 $ [
+    ComAdd (Addr $ valAddrFrame) (valAddrStackTop) (Val $ layerNum * n)
+  ]
+
+l1PopLocalVar :: Int -> L1Command
+l1PopLocalVar n = arrAsL1 $ [
+    ComSub (Addr $ valAddrFrame) (valAddrStackTop) (Val $ layerNum * n)
+  ]
+
+
+l1EvalExpressionIntoVar  :: L1Expression -> L1Destination -> L1Command
+l1EvalExpressionIntoVar exp vid = 
+  case vid of
+    L1DVar (L1VIL v)  -> l1Fold [
+        l1PushExpressionOnStack exp,
+        l1CalcNthLocalArgVarAddrIntoAddr v (addr realAddrRegDest), 
+        asL1 $ ComSet (Addr $ ptr realAddrRegDest) (ptrStackTop),
+        l1PopLocalVar 1
+      ]
+    L1DVar (L1VIG v)  -> l1Fold [
+        l1PushExpressionOnStack exp,
+        asL1 $ ComSet  (addr $ calcRealAddrFromLayeredAddr Stack v) (ptrStackTop),
+        l1PopLocalVar 1
+      ]
+    L1DAddr addr      -> l1Fold [ 
+        l1PushExpressionOnStack exp,
+        asL1 $ ComSet (addr) (ptrStackTop),
+        l1PopLocalVar 1
+      ]
+    L1DReturn         -> l1Fold [
+        l1PushExpressionOnStack exp,
+        asL1 $ ComSet (Addr $ valAddrFrame) (ptrStackTop)
+      ]
+    L1DTrash          -> l1Fold [ 
+        l1PushExpressionOnStack exp,
+        l1PopLocalVar 1
+      ]
+l1PushExpressionOnStack  :: L1Expression -> L1Command
+l1PushExpressionOnStack exp =
+  case exp of
+    L1EVal v          -> l1Fold [
+        l1PushLocalVar 1,
+        asL1 $ ComSet (Addr $ valAddrStackTop) v
+      ]
+    L1EVar (L1VIL v)  -> l1Fold [
+        l1PushLocalVar 1,
+        l1CalcNthLocalArgVarAddrIntoAddr v (addr realAddrRegSource1),
+        asL1 $ ComSet (Addr $ valAddrStackTop) (Ptr $ ptr realAddrRegSource1)
+      ]
+    L1EVar (L1VIG v)  -> l1Fold [
+        l1PushLocalVar 1,
+        asL1 $ ComSet (Addr $ valAddrStackTop) (ptrNthGlobalVar v)
+    ]
+    L1EFun fname exps -> l1Fold [ \flmap l -> 
+        case Mp.lookup fname flmap of
+          Nothing -> Left $ L1NoFunctionNamed (l1fName fname)
+          Just fl ->
+            let cmds = \len -> l1Fold ([
+                    l1PushLocalVar 3
+                  ] <> mapWithIndex (\i e -> l1PushExpressionOnStack e) exps <> [
+                    l1PopLocalVar (3 + length exps),
+                    l1PushCallStack (l+len) (length exps),
+                    asL1 $ ComSet (addr realAddrPC) (Val fl)
+                  ])
+                cmdslen = length <$> (cmds 0) flmap l
+            in (\len -> (cmds len) flmap l) =<< cmdslen,
+        l1PushLocalVar 1
+      ]
+    L1EInline0Ary l1cmd -> l1Fold [
+        l1PushLocalVar 1,
+        l1cmd (Addr valAddrStackTop)
+      ]
+    L1EInline1Ary l1cmd e1 -> l1Fold [
+        l1PushExpressionOnStack e1,
+        l1cmd (Addr valAddrStackTop) (Ptr  valAddrStackTop)
+      ]
+    L1EInline2Ary l1cmd e1 e2 -> l1Fold [
+        l1PushExpressionOnStack e1,
+        l1PushExpressionOnStack e2,
+        asL1 $ ComSet (addr realAddrRegValue1) (Ptr valAddrStackTop),
+        l1PopLocalVar 1,
+        l1cmd (Addr valAddrStackTop) (Ptr valAddrStackTop) (ptr realAddrRegValue1)
+      ]
+
+
+l1Return ::  L1Expression -> L1Command
+l1Return exp = l1Fold $ [
+    l1EvalExpressionIntoVar exp L1DReturn,
+    l1CalcReturnLineIntoAddr (addr realAddrRegLine),
+    l1PopCallStack,
+    asL1 $ ComSet (addr realAddrPC) (ptr realAddrRegLine)
+  ]
+
+
+l1IfElse :: L1Expression -> L1Command -> L1Command -> L1Command
+l1IfElse cond cmdthen cmdelse = \flm i -> do
+  let before = l1Fold [
+          l1PushExpressionOnStack cond,
+          asL1 $ ComAdd (addr realAddrPC) (ptr realAddrPC) (Ptr $ valAddrStackTop) --If true, skip the jumper
+        ]
+  let jumper   = \lineelse -> [
+          ComSet (addr realAddrPC) (Val lineelse) -- otherwise, go [else]
+        ]
+  let length_jumper   = 1
+  let aftergo = l1Fold [ 
+          l1PopLocalVar 1
+      ]
+  let returner = \linereturn -> [
+          ComSet (addr realAddrPC) (Val linereturn) -- end [then]
+      ]
+  let length_returner = 1
+  let afterjump = l1Fold [ 
+          l1PopLocalVar 1
+      ]
+  before_compiled    <- before    flm i
+  aftergo_compiled   <- aftergo   flm (i + length before_compiled + length_jumper)
+  cmdthen_compiled   <- cmdthen   flm (i + length before_compiled + length_jumper + length aftergo_compiled)
+  afterjump_compiled <- afterjump flm (i + length before_compiled + length_jumper + length aftergo_compiled + length cmdthen_compiled + length_returner)
+  cmdelse_compiled   <- cmdelse   flm (i + length before_compiled + length_jumper + length aftergo_compiled + length cmdthen_compiled + length_returner + length afterjump_compiled)
+  Right $ 
+       before_compiled 
+    <> jumper   (i + length before_compiled + length_jumper + length aftergo_compiled + length cmdthen_compiled + length_returner                                                      )
+    <> aftergo_compiled   
+    <> cmdthen_compiled   
+    <> returner (i + length before_compiled + length_jumper + length aftergo_compiled + length cmdthen_compiled + length_returner + length afterjump_compiled + length cmdelse_compiled)
+    <> afterjump_compiled 
+    <> cmdelse_compiled
+
+l1Case :: Array (Tuple L1Expression L1Command) -> L1Command -> L1Command
+l1Case conds cmdelse = \flm i -> do
+  let before = \cond -> l1Fold [
+          l1PushExpressionOnStack cond,
+          asL1 $ ComAdd (addr realAddrPC) (ptr realAddrPC) (Ptr $ valAddrStackTop) --If true, skip the jumper
+        ]
+  let jumper   = \lineelse -> [
+          ComSet (addr realAddrPC) (Val lineelse) -- otherwise, go [else]
+        ]
+  let length_jumper   = 1
+  let aftergo = l1Fold [ 
+          l1PopLocalVar 1
+      ]
+  let returner = \linereturn -> [
+          ComSet (addr realAddrPC) (Val linereturn) -- end [then]
+      ]
+  let length_returner = 1
+  let afterjump = l1Fold [ 
+          l1PopLocalVar 1
+      ]
+  let cmds_offset getcmds = 
+        let offset = length (getcmds 0)
+            cmds   = getcmds offset
+        in  Tuple cmds offset
+  let cases = \linereturn ->
+        cmds_offset <$>
+          foldM (\getcmds (Tuple cond cmdthen) -> do
+            let (Tuple cmds offset) = cmds_offset getcmds
+            before_compiled    <- before cond flm (i + length cmds)
+            aftergo_compiled   <- aftergo     flm (i + length cmds + length before_compiled + length_jumper)
+            cmdthen_compiled   <- cmdthen     flm (i + length cmds + length before_compiled + length_jumper + length aftergo_compiled)
+            afterjump_compiled <- afterjump   flm (i + length cmds + length before_compiled + length_jumper + length aftergo_compiled + length cmdthen_compiled + length_returner)
+            pure $ \offset ->
+                 cmds
+              <> before_compiled 
+              <> jumper   (i + offset)
+              <> aftergo_compiled   
+              <> cmdthen_compiled   
+              <> returner linereturn
+              <> afterjump_compiled 
+          ) (const []) conds
+  
+  cases_length <- snd <$> (cases 0)
+
+  cmdelse_compiled <- cmdelse flm (i + cases_length)
+  
+  let returnline = i + cases_length + length cmdelse_compiled
+  
+  cases_compiled <- fst <$> cases returnline
+
+  pure $ 
+       cases_compiled
+    <> cmdelse_compiled
+
+l1While :: L1Expression -> L1Command -> L1Command
+l1While cond cmd = \flm i -> do
+  let before = l1Fold [
+          l1PushExpressionOnStack cond,
+          asL1 $ ComAdd (addr realAddrPC) (ptr realAddrPC) (Ptr $ valAddrStackTop) --If true, skip the jumper
+        ]
+  let jumper   = \lineend -> [
+          ComSet (addr realAddrPC) (Val lineend) -- otherwise, go end
+        ]
+  let length_jumper   = 1
+  let aftergo = l1Fold [ 
+          l1PopLocalVar 1
+      ]
+  let returner = \linereturn -> [
+          ComSet (addr realAddrPC) (Val linereturn) -- go back
+      ]
+  let length_returner = 1
+  let afterjump = l1Fold [ 
+          l1PopLocalVar 1
+      ]
+  before_compiled    <- before    flm  i
+  aftergo_compiled   <- aftergo   flm (i + length before_compiled + length_jumper)
+  cmd_compiled       <- cmd       flm (i + length before_compiled + length_jumper + length aftergo_compiled)
+  afterjump_compiled <- afterjump flm (i + length before_compiled + length_jumper + length aftergo_compiled + length cmd_compiled + length_returner)
+  Right $ 
+       before_compiled 
+    <> jumper   (i + length before_compiled + length_jumper + length aftergo_compiled + length cmd_compiled + length_returner)
+    <> aftergo_compiled   
+    <> cmd_compiled   
+    <> returner i
+    <> afterjump_compiled
+
+
+
+data L2GlobalVariableTag = L2GVT NameSpace Int String
+derive instance genericL2GlobalVariableTag :: Generic (L2GlobalVariableTag) _
+instance eqL2GlobalVariableTag :: Eq (L2GlobalVariableTag) where
+  eq = genericEq
+instance ordL2GlobalVariableTag :: Ord (L2GlobalVariableTag) where
+  compare = genericCompare
+data L2GlobalVariable :: Type -> Type
+data L2GlobalVariable a = L2GV L2GlobalVariableTag
+
+data L2StaticVariableTag = L2SVT Int String
+derive instance genericL2StaticVariableTag :: Generic (L2StaticVariableTag) _
+instance eqL2StaticVariableTag :: Eq (L2StaticVariableTag) where
+  eq = genericEq
+instance ordL2StaticVariableTag :: Ord (L2StaticVariableTag) where
+  compare = genericCompare
+data L2StaticVariable :: Type -> Type
+data L2StaticVariable a = L2SV L2StaticVariableTag
+type L2SV = L2StaticVariable
+
+data L2LocalVariableTag = L2LVT Int String
+derive instance genericL2LocalVariableTag :: Generic (L2LocalVariableTag) _
+instance eqL2LocalVariableTag :: Eq (L2LocalVariableTag) where
+  eq = genericEq
+instance ordL2LocalVariableTag :: Ord (L2LocalVariableTag) where
+  compare = genericCompare
+data L2LocalVariable :: Type -> Type
+data L2LocalVariable a = L2LV L2LocalVariableTag
+type L2LV = L2LocalVariable
+
+derive instance newtypeGlobalDictL2 :: Newtype GlobalDictL2 _
+newtype GlobalDictL2  = GDL2 {
+    cntvars::Int,
+    cntfuncs::Int,
+    depcntvars::Mp.Map NameSpace Int,
+    realFuncs::Mp.Map L1FunctionTag (MonadL2Local Unit)
+  }
+globalDictL2Empty = GDL2 {
+    cntvars    : 0,
+    cntfuncs   : 0,
+    depcntvars : Mp.empty,
+    realFuncs  : Mp.empty
+  }
+type MonadL2Global = ReaderT NameSpace (State GlobalDictL2)
+runMonadL2Global :: forall a. NameSpace -> MonadL2Global a -> Tuple a GlobalDictL2
+runMonadL2Global ns pkg = (flip runReaderT ns >>> flip runState globalDictL2Empty) pkg
+derive instance newtypeLocalDictL2 :: Newtype LocalDictL2 _
+newtype LocalDictL2   = LDL2 {
+    cntvars :: Int,
+    cntsvars:: Int,
+    deps    :: Se.Set L1FunctionTag,
+    code    :: Array L1Command
+  }
+localDictL2Empty = LDL2 {
+    cntvars : 0,
+    cntsvars: 0,
+    deps    : Se.empty,
+    code    : []
+  }
+
+newtype GlobalDataL2 = GlobalDataL2 {getGlobalVarId :: (L2GlobalVariableTag -> Int), getStaticVarId :: (L2StaticVariableTag -> Int)}
+type MonadL2Local  = ReaderT GlobalDataL2 (State LocalDictL2)
+type ML2L = MonadL2Local
+
+runMonadL2Local :: forall a. (L2GlobalVariableTag -> Int) -> (L2StaticVariableTag -> Int) -> LocalDictL2 -> MonadL2Local a -> Tuple a LocalDictL2
+runMonadL2Local getGlobalVarId getStaticVarId dict fun = (flip runReaderT (GlobalDataL2 {getGlobalVarId, getStaticVarId}) >>> flip runState dict) fun
+
+newtype L2Expression :: Type -> Type
+newtype L2Expression a = L2E L1Expression
+derive instance newtypeL2Expression :: Newtype (L2Expression a) _
+
+l2LVarToL1 (L2LV (L2LVT i _)) = L1VIL i
+l2ELVar v = L2E $ L1EVar $ l2LVarToL1 v
+
+class L2Type a where
+  l2pure :: a -> L2Expression a
+
+toProxy :: forall a. a -> Proxy a
+toProxy a = Proxy 
+
+
+class N_aryL2FuncOf :: Type -> Constraint
+class N_aryL2FuncOf a where
+  l2ArgToLocal  :: (Int -> String) -> a -> MonadL2Local L1Expression
+  l2GetAry      :: Proxy (a) -> Int
+
+instance N_aryL2FuncOf (MonadL2Local Unit) where
+  l2ArgToLocal _ f = f >>= \_ -> pure (L1EVal (Val 0))
+  l2GetAry       = const 0
+
+instance N_aryL2FuncOf (MonadL2Local (L2E b)) where
+  l2ArgToLocal _ f = unwrap <$> f
+  l2GetAry       = const 0
+
+instance (N_aryL2FuncOf f) => N_aryL2FuncOf (L2E a -> f) where
+  l2ArgToLocal n f = l2NewLocalArg (n $ l2GetAry (Proxy :: Proxy f) + 1) >>= \v -> l2ArgToLocal n (f (l2ELVar v))
+  l2GetAry         = const $ l2GetAry (Proxy :: Proxy f) + 1
+
+class N_aryL2Applyable :: Type -> Type -> Constraint
+class N_aryL2Applyable f f' | f' -> f where
+  applyL1FAsL2  :: L1FunctionTag -> Array (ML2L L1Expression) -> f'
+
+instance N_aryL2Applyable (MonadL2Local Unit) (MonadL2Local Unit) where
+  applyL1FAsL2 f marr = (modify (\(LDL2 ldl2) -> LDL2 ldl2{deps = Se.insert f ldl2.deps})) >>= \_ -> sequence marr >>= \arr -> asL2 (l1EvalExpressionIntoVar (L1EFun f arr) L1DTrash)
+
+instance N_aryL2Applyable (MonadL2Local (L2E b)) (MonadL2Local (L2E b)) where
+  applyL1FAsL2 f marr = (modify (\(LDL2 ldl2) -> LDL2 ldl2{deps = Se.insert f ldl2.deps})) >>= \_ -> sequence marr >>= \arr -> pure $ L2E $ L1EFun f arr
+
+instance (N_aryL2Applyable f f', ML2Eish a ea) => N_aryL2Applyable (L2E a -> f) (ea -> f') where
+  applyL1FAsL2 f marr = \a -> applyL1FAsL2 f (snoc marr (toML1E a))
+
+l2Apply :: forall f f'. N_aryL2Applyable f f' => L2Function f -> f'
+l2Apply (L2F f) = applyL1FAsL2 f []
+
+
+data L2Function a = L2F L1FunctionTag
+
+
+compileL2 :: forall a. MonadL2Global a -> Either CompileError CompilationResult
+compileL2 pkg = 
+  let (Tuple _ (GDL2 gdict)) = runMonadL2Global "main" pkg 
+      (Tuple cntGlobalVars globalVarIdOffset) = foldl (\(Tuple sum summap) (Tuple ns cnt) -> Tuple (sum+cnt) (Mp.insert ns sum summap) ) (Tuple 0 Mp.empty) (Mp.toUnfoldable gdict.depcntvars)
+      getGlobalVarId (L2GVT ns i _) = fromMaybe 0 ((_+i) <$> Mp.lookup ns globalVarIdOffset)
+      collectDepsRec offset fname mapl1cmds = if Mp.member fname mapl1cmds then Right (Tuple mapl1cmds offset) else
+        case Mp.lookup fname gdict.realFuncs of
+          Nothing -> Left $ L2NoFunctionNamed (l1fName fname)
+          Just f  -> let (Tuple _ (LDL2 ldl2)) = runMonadL2Local getGlobalVarId (\(L2SVT i _) -> (offset+i)) localDictL2Empty f
+                     in  foldM (\(Tuple newmap newoffset) dep -> collectDepsRec newoffset dep newmap) (Tuple (Mp.insert fname (l1Fold ldl2.code) mapl1cmds) (offset + ldl2.cntsvars)) (Se.toUnfoldable ldl2.deps)
+  in (\(Tuple funcmap offset) -> compileL1 offset funcmap) =<< (collectDepsRec cntGlobalVars L1FMain Mp.empty)
+
+asL2 :: L1Command -> MonadL2Local Unit
+asL2 cmd = do
+  ldict <- unwrap <$> get
+  put  $ LDL2 $ ldict {code = ldict.code <> [cmd]}
+
+importAs :: forall a. NameSpace -> MonadL2Global a -> MonadL2Global a
+importAs ns pkg = (\(Tuple result (GDL2 pkggdict)) -> modify (\(GDL2 mygdict) -> GDL2 $ mygdict {
+    depcntvars = (Mp.unionWith max pkggdict.depcntvars >>> Mp.alter (\x -> Just $ (maybe identity max x) pkggdict.cntvars) ns) mygdict.depcntvars,
+    realFuncs  = Mp.union (Mp.delete L1FMain pkggdict.realFuncs) mygdict.realFuncs
+  }) >>= \_ -> pure result) $ runMonadL2Global ns pkg
+
+
+l2VirtualFunc :: forall f. String -> N_aryL2FuncOf f =>  MonadL2Global (L2Function f)
+l2VirtualFunc name = do
+  namespace <- ask
+  gdict     <- unwrap <$> get
+  put  $ GDL2 $ gdict {cntfuncs = gdict.cntfuncs+1}
+  pure $ L2F  (L1FUser namespace (gdict.cntfuncs+1) name)
+
+l2VirtualFuncMain :: forall f. N_aryL2FuncOf f =>  MonadL2Global (L2Function f)
+l2VirtualFuncMain = pure $ L2F (L1FMain)
+
+l2SetRealFunc :: forall f. N_aryL2FuncOf f => L2Function f -> f -> MonadL2Global Unit
+l2SetRealFunc (L2F f) (real) = do
+  namespace <- ask
+  gdict     <- unwrap <$> get
+  let func = (do
+        exp <- l2ArgToLocal (\i -> "arg_" <> show (l2GetAry (Proxy :: Proxy f) - i)) real
+        asL2 $ l1Return exp
+        pure unit
+      )
+  put  $ GDL2 $ gdict {realFuncs = Mp.insert f func gdict.realFuncs}
+
+l2RealFunc :: forall f. N_aryL2FuncOf f  => String -> f -> MonadL2Global (L2Function f)
+l2RealFunc name real = do
+  f <- l2VirtualFunc name
+  l2SetRealFunc f real
+  pure f
+
+l2RealFuncMain :: forall f. N_aryL2FuncOf f => f -> MonadL2Global (L2Function f)
+l2RealFuncMain real = do
+  f <- l2VirtualFuncMain
+  l2SetRealFunc f real
+  pure f
+
+l2NewGlobalVar :: forall a. MonadL2Global (L2GlobalVariable a)
+l2NewGlobalVar = do
+  namespace <- ask
+  gdict     <- unwrap <$> get
+  let newvar = gdict.cntvars+1
+  put  $ GDL2 $ gdict {cntvars = newvar, depcntvars = Mp.insert namespace newvar gdict.depcntvars}
+  pure $ L2GV $ L2GVT namespace gdict.cntvars ""
+
+l2NewLocalArg   :: forall a. String -> MonadL2Local  (L2LocalVariable a)
+l2NewLocalArg  name  = do
+  ldict <- unwrap <$> get
+  put  $ LDL2 $ ldict {cntvars = ldict.cntvars+1}
+  pure $ L2LV $ L2LVT (ldict.cntvars) name
+
+l2NewLocalVar   :: forall a.  MonadL2Local  (L2LocalVariable a)
+l2NewLocalVar  = do
+  ldict <- unwrap <$> get
+  put  $ LDL2 $ ldict {cntvars = ldict.cntvars+1}
+  asL2 $ l1PushLocalVar 1
+  pure $ L2LV $ L2LVT (ldict.cntvars) ""
+
+
+l2NewStaticVar  :: forall a.  MonadL2Local  (L2StaticVariable a)
+l2NewStaticVar = do
+  (GlobalDataL2 gdata) <- ask
+  ldict <- unwrap <$> get
+  put  $ LDL2 $ ldict {cntsvars = ldict.cntsvars+1}
+  asL2 $ l1PushLocalVar 1
+  pure $ L2SV $ L2SVT ldict.cntsvars ""
+
+l2IfElse :: forall a. ML2Eish Boolean a => a  -> MonadL2Local Unit -> MonadL2Local Unit -> MonadL2Local Unit
+l2IfElse mcond cmdthen cmdelse = do
+  cond <- toML1E mcond
+  oldcode  <- (\(LDL2 d) -> d.code) <$> get
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = []})
+  cmdthen
+  thencode <- (\(LDL2 d) -> d.code) <$> get 
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = []})
+  cmdelse
+  elsecode <- (\(LDL2 d) -> d.code) <$> get 
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = oldcode <> [l1IfElse cond (l1Fold thencode) (l1Fold elsecode)]})
+  pure unit
+
+
+l2Case :: forall a. ML2Eish Boolean a => Array (Tuple a (MonadL2Local Unit)) -> MonadL2Local Unit -> MonadL2Local Unit
+l2Case conds cmdelse = do
+  oldcode  <- (\(LDL2 d) -> d.code) <$> get
+  
+  cases <- traverse (\(Tuple mcond cmd) -> do
+      cond <- toML1E mcond
+      _ <- modify (\(LDL2 d) -> LDL2 d{code = []})
+      cmd
+      (\(LDL2 d) -> (Tuple cond (l1Fold d.code))) <$> get
+    ) conds
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = []})
+  cmdelse
+  elsecode <- (\(LDL2 d) -> d.code) <$> get 
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = oldcode <> [l1Case cases (l1Fold elsecode)]})
+  pure unit
+
+l2While :: forall a. ML2Eish Boolean a => a -> MonadL2Local Unit -> MonadL2Local Unit
+l2While mcond cmd = do
+  cond <- toML1E mcond
+  oldcode <- (\(LDL2 d) -> d.code) <$> get
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = []})
+  cmd
+  code <- (\(LDL2 d) -> d.code) <$> get
+  _ <- modify (\(LDL2 d) -> LDL2 d{code = oldcode <> [l1While cond (l1Fold code)]})
+  pure unit
+
+l2RepNtimes :: forall ei. ML2Eish Int ei => ei -> MonadL2Local Unit -> MonadL2Local Unit
+l2RepNtimes n cmd = do
+  i <- l2NewLocalVar
+  i <<- n
+  l2While (0 <^ i) (cmd >>= \_ -> i <<- i -^ 1)
+
+l2Return :: forall ee. ML1Eish ee => ee -> MonadL2Local Unit
+l2Return e = asL2 =<< l1Return <$> toML1E e
+
+ml2EPrim0Ary     ::   forall a.                                   (Address ->                   Command)           -> ML2L (L2E a)
+ml2EPrim0Ary     com     = pure $ L2E $ L1EInline0Ary (\ad       -> asL1 $ com ad) 
+ml2EPrim1Ary     ::   forall a b c. (ML1Eish a) =>                (Address -> Value ->          Command) -> a      -> ML2L (L2E b)
+ml2EPrim1Ary     com a   = L2E <$> (L1EInline1Ary (\ad v1    -> asL1 $ com ad v1   ) <$> (toML1E a))
+ml2EPrim2Ary     ::   forall a b c. (ML1Eish a) => (ML1Eish c) => (Address -> Value -> Value -> Command) -> a -> c -> ML2L (L2E b)
+ml2EPrim2Ary     com a b = L2E <$> (L1EInline2Ary (\ad v1 v2 -> asL1 $ com ad v1 v2) <$> (toML1E a) <*> (toML1E b))
+ml2EPrim1Ary_Inv   :: forall a b c. (ML1Eish a) =>                (Address -> Value ->          Command) -> a      -> ML2L (L2E Boolean)
+ml2EPrim1Ary_Inv com a   = L2E <$> (L1EInline1Ary (\ad v1    -> arrAsL1 [com ad v1   , ComXor ad (asPtr ad) (Val 1)]) <$> (toML1E a))
+ml2EPrim2Ary_Inv   :: forall a b c. (ML1Eish a) => (ML1Eish c) => (Address -> Value -> Value -> Command) -> a -> c -> ML2L (L2E Boolean)
+ml2EPrim2Ary_Inv com a b = L2E <$> (L1EInline2Ary (\ad v1 v2 -> arrAsL1 [com ad v1 v2, ComXor ad (asPtr ad) (Val 1)]) <$> (toML1E a) <*> (toML1E b))
+
+asL1_0Ary com = \a     -> asL1 (com a)
+asL1_1Ary com = \a b   -> asL1 (com a b)
+asL1_2Ary com = \a b c -> asL1 (com a b c)
+
+data L2Ptr a = L2Ptr Int
+class L2CNum :: Type -> Constraint
+class L2CNum a 
+instance L2CNum Char
+instance L2CNum Int
+instance L2CNum (L2Ptr a)
+
+class L2CBit a
+instance L2CBit Boolean
+else instance L2CNum a => L2CBit a
+
+class L2CFromReal :: Type -> Constraint
+class L2CFromReal a where
+  fromReal :: a -> L2Expression a
+
+instance L2CFromReal Int where
+  fromReal (n) = (L2E <<< L1EVal <<< Val) n
+
+instance L2CFromReal Char where
+  fromReal (c) = (L2E <<< L1EVal <<< Val) (fromEnum $ codePointFromChar c)
+
+instance L2CFromReal (L2Ptr a) where
+  fromReal (L2Ptr n) = (L2E <<< L1EVal <<< Val) n
+
+instance L2CFromReal Boolean where
+  fromReal (false) = (L2E <<< L1EVal <<< Val) 0
+  fromReal (true ) = (L2E <<< L1EVal <<< Val) 1
+
+unsafecast :: forall ea a b. ML2Eish a ea => ea -> ML2E b
+unsafecast = map L2E <<< toML1E
+
+intcast :: forall ea a b. ML2Eish a ea => ea -> ML2E Int
+intcast = unsafecast
+
+class L2CCastable a b where
+  cast :: forall ea. ML2Eish a ea => ea -> ML2E b
+
+instance L2CCastable Boolean Int where
+  cast = unsafecast
+
+else instance L2CCastable Int Boolean where
+  cast = map (\i ->L2E $ L1EInline2Ary (\ad v1 v2 -> arrAsL1 [ComEq ad v1 v2, ComXor ad (asPtr ad) (Val 1)]) (L1EVal (Val 0)) i) <<< toML1E
+
+else instance (L2CNum a, L2CNum b) => L2CCastable a b where
+  cast = unsafecast
+
+
+
+
+infix 0 l2Assign as <<-
+
+class L2Assignable :: Type -> Type -> Constraint
+class L2Assignable a va | va -> a where
+  l2Assign :: forall ea. ML2Eish a ea => va -> ea -> MonadL2Local Unit
+
+instance L2Assignable a (L2LocalVariable a) where
+  l2Assign (L2LV (L2LVT i _)) mexp = do
+    exp <- toML1E mexp
+    asL2 $ l1Fold [
+      l1EvalExpressionIntoVar exp (L1DVar (L1VIL i))
+    ]
+
+else instance L2Assignable a (L2StaticVariable a) where
+  l2Assign (L2SV t) mexp = do
+    (GlobalDataL2 gdl2) <- ask
+    exp <- toML1E mexp
+    asL2 $ l1Fold [
+      l1EvalExpressionIntoVar exp (L1DVar (L1VIG (gdl2.getStaticVarId t)))
+    ]
+
+else instance L2Assignable a (L2GlobalVariable a) where
+  l2Assign (L2GV t) mexp = do
+    (GlobalDataL2 gdl2) <- ask
+    exp <- toML1E mexp
+    asL2 $ l1Fold [
+      l1EvalExpressionIntoVar exp (L1DVar (L1VIG (gdl2.getGlobalVarId t)))
+    ]
+
+else instance ML2Eish (L2Ptr a) eptr => L2Assignable a eptr where
+  l2Assign ml2eishptr mexp = do
+    l1ptr <- toML1E ml2eishptr
+    exp <- toML1E mexp
+    asL2 $ l1Fold [
+      l1PushExpressionOnStack l1ptr,
+      l1EvalExpressionIntoVar exp (L1DAddr $ addr realAddrRegValue1),
+      asL1 $ ComSet (Addr $ ptrStackTop) (ptr realAddrRegValue1),
+      l1PopLocalVar 1
+    ]
+
+
+class ML2Eish :: Type -> Type -> Constraint
+class ML2Eish a ea | ea -> a where
+  toML2E :: ea -> ML2L (L2E a)
+
+instance ML2Eish a ea => ML2Eish a (ML2L ea) where
+  toML2E = flip bind toML2E
+
+else instance ML2Eish a (L2E a) where
+  toML2E = pure
+
+else instance ML2Eish a (L2LocalVariable a) where
+  toML2E (L2LV (L2LVT i _)) = pure $ L2E $ L1EVar $ L1VIL i
+
+else instance ML2Eish a (L2StaticVariable a) where
+  toML2E (L2SV t) = do
+    (GlobalDataL2 gdl2) <- ask
+    pure $ L2E $ L1EVar $ L1VIG (gdl2.getStaticVarId t)
+
+else instance ML2Eish a (L2GlobalVariable a) where
+  toML2E (L2GV t) = do
+    (GlobalDataL2 gdl2) <- ask
+    pure $ L2E $ L1EVar $ L1VIG (gdl2.getGlobalVarId t)
+
+else instance L2CFromReal a => ML2Eish a a where
+  toML2E = pure <<< fromReal
+
+
+
+class ML1Eish a where
+  toML1E :: a -> ML2L L1Expression
+
+instance ML2Eish a ea => ML1Eish ea where
+  toML1E x = unwrap <$> (toML2E x :: ML2L (L2E a))
+
+
+type L2E = L2Expression
+type ML2E a = ML2L (L2E a)
+type L2F = L2Function
+
+l2ComIn :: forall a b.                                                                   ML2E a 
+l2ComIn  = ml2EPrim0Ary ComIn 
+l2ComSet:: forall a e1a.                 ML2Eish a e1a =>                  e1a ->        ML2E a
+l2ComSet = ml2EPrim1Ary ComSet
+l2ComAdd:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComAdd = ml2EPrim2Ary ComAdd
+l2ComSub:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComSub = ml2EPrim2Ary ComSub
+l2ComMul:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComMul = ml2EPrim2Ary ComMul
+l2ComDiv:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComDiv = ml2EPrim2Ary ComDiv
+l2ComMod:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComMod = ml2EPrim2Ary ComMod
+l2ComAnd:: forall a e1a e2a. L2CBit a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComAnd = ml2EPrim2Ary ComAnd
+l2ComOr :: forall a e1a e2a. L2CBit a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComOr  = ml2EPrim2Ary ComOr
+l2ComNot:: forall a e1a.     L2CBit a => ML2Eish a e1a =>                  e1a ->        ML2E a
+l2ComNot = ml2EPrim1Ary ComNot
+l2ComXor:: forall a e1a e2a. L2CBit a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComXor = ml2EPrim2Ary ComXor
+l2ComShr:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComShr = ml2EPrim2Ary ComShr
+l2ComShl:: forall a e1a e2a. L2CNum a => ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E a
+l2ComShl = ml2EPrim2Ary ComShl
+l2ComGt :: forall a e1i e2i. L2CNum a => ML2Eish a e1i => ML2Eish a e2i => e1i -> e2i -> ML2E Boolean
+l2ComGt  = ml2EPrim2Ary ComGt
+l2ComLe :: forall a e1i e2i. L2CNum a => ML2Eish a e1i => ML2Eish a e2i => e1i -> e2i -> ML2E Boolean
+l2ComLe  = ml2EPrim2Ary ComLe
+l2ComEq :: forall a e1a e2a.             ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E Boolean
+l2ComEq  = ml2EPrim2Ary ComEq
+l2ComLeq :: forall a e1i e2i.L2CNum a => ML2Eish a e1i => ML2Eish a e2i => e1i -> e2i -> ML2E Boolean
+l2ComLeq = ml2EPrim2Ary_Inv ComGt
+l2ComGeq :: forall a e1i e2i.L2CNum a => ML2Eish a e1i => ML2Eish a e2i => e1i -> e2i -> ML2E Boolean
+l2ComGeq = ml2EPrim2Ary_Inv ComLe
+l2ComNeq :: forall a e1a e2a.            ML2Eish a e1a => ML2Eish a e2a => e1a -> e2a -> ML2E Boolean
+l2ComNeq = ml2EPrim2Ary_Inv ComEq
+l2ComLNot :: forall e1b.           ML2Eish Boolean e1b =>                  e1b ->        ML2E Boolean
+l2ComLNot  = ml2EPrim1Ary_Inv ComSet
+
+l2ComRef :: forall a eptr.                      ML2Eish (L2Ptr a) eptr => eptr ->        ML2E a
+l2ComRef eptr = L2E <$> (L1EInline1Ary (\ad pa -> arrAsL1 [ComSet ad (Ptr pa)]) <$> (toML1E eptr))
+
+infixl 6  l2ComAdd as +^
+infixl 6  l2ComSub as -^
+infixl 7  l2ComMul as *^
+infixl 7  l2ComDiv as /^
+infixl 7  l2ComMod as %^
+infixl 2  l2ComAnd as &^
+infixl 2  l2ComOr  as |^
+infixl 2  l2ComXor as ^^
+infixl 5  l2ComShr as >>^
+infixl 5  l2ComShl as <<^
+infixl 4  l2ComGt  as >^
+infixl 4  l2ComGeq as >=^
+infixl 4  l2ComLe  as <^
+infixl 4  l2ComLeq as <=^
+infixl 3  l2ComEq  as ==^
+infixl 3  l2ComNeq as !=^
+
+not = l2ComLNot
+bnot = l2ComNot
+
+l2PrimGetHeap :: forall a ei. ML2Eish Int ei => ei -> ML2E (a)
+l2PrimGetHeap amount = L2E <$> (L1EInline1Ary (\ad am -> l1Fold [
+    asL1 $ ComMul (addr realAddrRegValue2)       am                          (Val layerNum         ),
+    asL1 $ ComSet  ad                           (ptr realAddrHeapBlankStart)                        ,
+    asL1 $ ComAdd (addr realAddrHeapBlankStart) (ptr realAddrHeapBlankStart) (ptr realAddrRegValue2)
+  ]) <$> (toML1E amount))
+
+l2PrimOffsetAccess :: forall a eaa ei. ML1Eish eaa => ML2Eish Int ei => eaa -> ei -> ML2E (L2Ptr a)
+l2PrimOffsetAccess address amount = L2E <$> (L1EInline2Ary (\de ad am -> l1Fold [
+    asL1 $ ComMul (addr realAddrRegValue2) am (Val layerNum),
+    asL1 $ ComAdd de (ptr realAddrRegValue2) ad
+  ]) <$> (toML1E address) <*> (toML1E amount))
+
+l2PrimOffsetAccessRead :: forall a eaa ei. ML1Eish eaa => ML2Eish Int ei => eaa -> ei -> ML2E a
+l2PrimOffsetAccessRead address amount = L2E <$> (L1EInline2Ary (\de ad am -> l1Fold [
+    asL1 $ ComMul (addr realAddrRegValue2) am (Val layerNum),
+    asL1 $ ComAdd (addr realAddrRegValue2) (ptr realAddrRegValue2) ad,
+    asL1 $ ComSet de (Ptr $ ptr realAddrRegValue2)
+  ]) <$> (toML1E address) <*> (toML1E amount))
+
+infixl 5  l2PrimOffsetAccessRead as @^
+infixl 4  l2PrimOffsetAccess     as @@^
+
+makearr :: forall a ei. ML2Eish Int ei => ei -> ML2E (L2Arr a) 
+makearr = unsafecast <<< l2PrimGetHeap 
+
+arrAt :: forall a ei eaa. ML2Eish (L2Arr a) eaa => ML2Eish Int ei => eaa -> ei -> ML2E (L2Ptr a)
+arrAt  arr idx = l2PrimOffsetAccess     arr idx
+
+arrRef :: forall a ei eaa. ML2Eish (L2Arr a) eaa => ML2Eish Int ei => eaa -> ei -> ML2E a
+arrRef arr idx = l2PrimOffsetAccessRead arr idx
+
+infixl 5  arrRef as #^
+infixl 4  arrAt  as ##^
+
+
+--data Ptrish :: (Type -> Type) -> Type -> Type
+
+--newArr :: forall a ei. L2Eish Int ei => ei -> MonadL2Local (L2Arr a)
+--newArr n = l2PrimGetHeap n
+
+
+
+decodeMem :: Memory -> String
+decodeMem mem = 
+  let r     = \addr -> fromMaybe 0 $ Mp.lookup addr mem
+      rshow = \prefix addr ->   prefix <> "(" <> show addr <> ") " <> show (r addr) <> "\n"
+  in  "real: " <> show mem <> "\n" <>
+      rshow "  PC         " realAddrPC <> 
+      rshow "  RegLine    " realAddrRegLine <>
+      rshow "  RegSource1 " realAddrRegSource1 <>
+      rshow "  RegSource2 " realAddrRegSource2 <>
+      rshow "  RegDest    " realAddrRegDest <>
+      rshow "  RegValue1  " realAddrRegValue1 <>
+      rshow "  RegValue2  " realAddrRegValue2 <>
+      rshow "  HeapBlank  " realAddrHeapBlankStart <>
+      rshow "  FramePtr   " realAddrFramePointer <>
+      rshow "    StackTop   " (r realAddrFramePointer + layerNum * 0) <>
+      rshow "    Parent     " (r realAddrFramePointer + layerNum * 1) <>
+      rshow "    ReturnLine " (r realAddrFramePointer + layerNum * 2) <>
+      "    LocalVars: " <> joinWith ", " (map ( (_*layerNum) >>> (_+(r realAddrFramePointer + layerNum * 3)) >>> r >>> show) (0 .. (min 20 $ (r (r realAddrFramePointer + layerNum * 0) - (r realAddrFramePointer + layerNum * 3)) / layerNum))) <> "\n"
+  
+debugWrite = appendTextFile UTF8 "./debug.log"
+timeWrite  = appendTextFile UTF8 "./time.log"
+
+type IOState = {input :: Array Int, output :: Array Int, linelog :: Mp.Map Int Int}
+ioStateDefault = {input : [], output : [], linelog : Mp.empty}
+
+debugIO2 :: IOManager (StateT IOState Effect)
+debugIO2 = {
+    getInt : do
+      ios <- get
+      put (ios {input = fromMaybe [] (tail ios.input)})
+      pure (head ios.input),
+    putInt : \i -> (modify (\ios -> ios {output = snoc ios.output i}) >>= \_ -> pure unit),
+                  -- >>= \_ -> lift $ log $ "\x1b[36mput: " <> show i <> (maybe "" (\c -> " (" <> c <> ")") (fromCodePoint i)) <> "\x1b[0m",
+    debug  : \s -> lift $ debugWrite $ "debug: " <> s,
+    onTick : \m -> do
+      _ <- modify (\ios -> ios {linelog = Mp.alter (Just <<< maybe 1 (_+1)) (readPC m.mem) ios.linelog})
+      lift $ debugWrite $ "\nmem: " <> decodeMem m.mem <> "\ncommand: " <> fromMaybe "[error]" (show <$> index m.code (readPC m.mem)) <> " [line " <> (show (readPC m.mem)) <> "]" <> " tick:" <> (show m.time) <> "\n"
+  }
+
+
+testRun :: forall a. Int -> String -> MonadL2Global a -> Effect Unit
+testRun maxtime inputstr m = do
+  writeTextFile UTF8 "./debug.log" ""
+  writeTextFile UTF8 "./time.log" ""
+  let iomanager = debugIO2
+  let input = (St.toCodePointArray >>> map fromEnum >>> flip snoc 0) inputstr
+  case compileL2 m of
+    Left err   -> logShow err
+    Right cmds -> do
+      writeTextFile UTF8 "./cmds.sasm" (joinWith "\n" (map showComWithComment cmds))
+      (Tuple result ioresult) <- flip runStateT ioStateDefault {input = input} $ runWithError iomanager maxtime (map fst cmds)
+      debugWrite ("\noutput : ")
+      debugWrite (show ioresult.output)
+      debugWrite ("\n")
+      debugWrite (show result)
+      timeWrite  (joinWith "\n" $ map (\(Tuple l c) -> show l <> "\t" <> show c) $ Mp.toUnfoldable ioresult.linelog)
+      log $ St.joinWith "" $ map (\i -> fromMaybe "�" (St.singleton <$> toEnum i)) $ ioresult.output
+      log $ (show $ fst result) <> " (" <> (show $ (snd result).time) <> " ticks)"
+
+
+showCode :: forall a. MonadL2Global a -> Either CompileError String
+showCode m = (\cmds -> joinWith "\n" (map showComWithComment cmds)) <$> compileL2 m
+
+f :: ∀ f f'. N_aryL2Applyable f f' ⇒ L2Function f → f'
+f = l2Apply
+
+u :: ML2L Unit -> ML2L Unit
+u = identity
+
+nop = asL2 $ l1Nop
+
+l2LibStdIO :: MonadL2Global {
+    macroPutString :: String -> MonadL2Local Unit,
+    macroPutChar   :: Char -> MonadL2Local Unit,
+    putChar  :: L2Function (L2E Char -> MonadL2Local Unit),
+    getInt   :: L2Function (ML2E Int),
+    printInt :: L2Function (L2E Int -> MonadL2Local Unit)
+  }
+l2LibStdIO = do
+  let macroPutChar  = \char -> asL2 $ (asL1 <<< ComOut <<< Val <<< fromEnum) (codePointFromChar char)
+  let macroPutString = \str -> asL2 $ l1Fold $ map (asL1 <<< ComOut <<< Val <<< fromEnum) (St.toCodePointArray str)
+
+  putChar <- l2VirtualFunc "putChar"
+  l2SetRealFunc putChar (\(L2E char) -> do
+      asL2 $ l1Fold [
+        --l1PushExpressionOnStack char,
+        asL1 $ ComOut ptrStackTop
+      ]
+    )
+  
+  getInt <- l2VirtualFunc "getInt"
+  l2SetRealFunc getInt (do
+      tmp  :: L2LV Int <- l2NewLocalVar
+      tmp  <<- 0
+      char :: L2LocalVariable Int <- l2NewLocalVar
+      char <<- (l2ComIn :: ML2E Int)
+
+      l2While ((char <^ 48) |^ (57 <^ char) ) do
+        char <<- (l2ComIn :: ML2E Int)
+      
+      l2While ((47 <^ char) &^ (char <^ 58) ) do
+        tmp  <<- tmp *^ 10 +^ (char -^ 48)
+        char <<- l2ComIn
+      
+      asL2 $ l1Fold [l1EvalExpressionIntoVar (L1EVar $ l2LVarToL1 char) (L1DAddr $ addr realAddrRegLastChar)] 
+
+      toML2E tmp
+    )
+  
+  printInt <- l2VirtualFunc "printInt"
+  l2SetRealFunc printInt (\i -> do
+      asL2 $ asL1 $ ComSet (addr realAddrRegValue1) ptrStackTop
+      l2IfElse (L2E $ L1EInline2Ary (asL1_2Ary ComGt) (L1EVal (Val 0)) (L1EVal $ ptr realAddrRegValue1))
+        -- then
+        (do
+          asL2 $ asL1 $ ComOut (Val 45)
+          asL2 $ asL1 $ ComMul (addr realAddrRegValue1) (ptr realAddrRegValue1) (Val (-1))
+        )
+        -- else
+        (do
+          nop
+        )
+      
+      l2IfElse (L2E $ L1EInline2Ary (asL1_2Ary ComEq) (L1EVal (Val 0)) (L1EVal $ ptr realAddrRegValue1))
+        -- then
+        (do
+          asL2 $ asL1 $ ComOut (Val 48)
+        )
+        -- else
+        (do
+          asL2 $ asL1 $ ComSet (addr realAddrRegValue2) (Val 0)
+          l2While (L2E $ L1EInline2Ary (asL1_2Ary ComLe) (L1EVal (Val 0)) (L1EVal $ ptr realAddrRegValue1)) (do
+            asL2 $ l1PushLocalVar 1
+            asL2 $ asL1 $ ComMod (Addr valAddrStackTop)   (ptr realAddrRegValue1) (Val 10)
+            asL2 $ asL1 $ ComAdd (Addr valAddrStackTop)   (Ptr valAddrStackTop)   (Val 48)
+            asL2 $ asL1 $ ComDiv (addr realAddrRegValue1) (ptr realAddrRegValue1) (Val 10)
+            asL2 $ asL1 $ ComAdd (addr realAddrRegValue2) (ptr realAddrRegValue2) (Val 1)
+          )
+          l2While (L2E $ L1EInline2Ary (asL1_2Ary ComLe) (L1EVal (Val 0)) (L1EVal $ ptr realAddrRegValue2)) (do
+            asL2 $ asL1 $ ComSub (addr realAddrRegValue2) (ptr realAddrRegValue2) (Val 1)
+            asL2 $ asL1 $ ComOut (Ptr valAddrStackTop)
+            asL2 $ l1PopLocalVar 1
+          )
+        )
+      pure unit
+    )
+  pure {macroPutString, macroPutChar, putChar, getInt, printInt}
+
+
+data L2MinPriorityQueue a
+
+
+l2LibMinPriorityQueue :: forall a. MonadL2Global {
+  new          :: L2F (L2E Int -> ML2E (L2MinPriorityQueue a)                              ),
+  push         :: L2F (L2E (L2MinPriorityQueue a) -> L2E a -> L2E Int  -> ML2L Unit        ),
+  heapifyUp    :: L2F (L2E (L2MinPriorityQueue a) -> L2E Int           -> ML2L Unit        ),
+  buildMinHeap :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2L Unit        ),
+  heapifyDown  :: L2F (L2E (L2MinPriorityQueue a) -> L2E Int           -> ML2L Unit        ),
+  pop          :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2L Unit        ),
+  getPriority  :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2E Int         ),
+  getValue     :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2E a           ),
+  getLength    :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2E Int         ),
+  hasElement   :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2E Boolean     ),
+  empty        :: L2F (L2E (L2MinPriorityQueue a)                      -> ML2E Boolean     ),
+  priorityAt   :: L2F (L2E (L2MinPriorityQueue a) -> L2E Int           -> ML2E (L2Ptr Int) ),
+  valueAt      :: L2F (L2E (L2MinPriorityQueue a) -> L2E Int           -> ML2E (L2Ptr a)   )
+}
+l2LibMinPriorityQueue = do
+  new <- l2VirtualFunc "new"
+  l2SetRealFunc new (\maxlen -> do
+      h <- l2NewLocalVar
+      h <<- (l2PrimGetHeap (maxlen *^ 2 +^ 1) :: (ML2E (L2Ptr Int)))
+      (unsafecast h) <<- (unsafecast (intcast h -^ layerNum))
+      toML2E (unsafecast h)
+    )
+
+  heapifyDown <- l2VirtualFunc "heapifyDown"
+  l2SetRealFunc heapifyDown (\queue parent -> do
+      left     <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      right    <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      end      <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      smallest <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      -- parent   <<- (unsafecast queue) +^ ((index *^ (2 * layerNum)) +^ (1 * layerNum))
+      -- left     <<- (unsafecast queue) +^ ((index *^ (4 * layerNum)) +^ (3 * layerNum)) -- (index *^2 +^ 1) *^2 +^ 1
+      -- right    <<- (unsafecast queue) +^ ((index *^ (4 * layerNum)) +^ (5 * layerNum)) -- (index *^2 +^ 2) *^2 +^ 1
+      left     <<- (intcast queue) +^ ((parent -^ (intcast queue)) *^ (2) +^ (layerNum * 1)) -- (index *^2 +^ 1) *^2 +^ 1
+      right    <<- (intcast queue) +^ ((parent -^ (intcast queue)) *^ (2) +^ (layerNum * 3)) -- (index *^2 +^ 2) *^2 +^ 1
+      end      <<- (l2ComRef (unsafecast queue))
+      smallest <<- parent
+      l2IfElse ((left  <=^ end) &^ (intcast (l2ComRef (cast parent) )  >^ intcast (l2ComRef (cast left )))) (do
+          smallest <<- left
+        ) (nop)
+      l2IfElse ((right <=^ end) &^ (intcast (l2ComRef (cast smallest)) >^ intcast (l2ComRef (cast right)))) (do
+          smallest <<- right
+        ) (nop)
+      l2IfElse (smallest ==^ parent) (nop) (do
+          tmpi <- l2NewLocalVar
+          tmpv <- l2NewLocalVar
+          tmpi                          <<- l2ComRef (cast  smallest)
+          tmpv                          <<- l2ComRef (cast (smallest +^ layerNum))
+          (cast  smallest)              <<- l2ComRef (cast parent)
+          (cast (smallest +^ layerNum)) <<- l2ComRef (cast (parent   +^ layerNum))
+          (cast  parent        )        <<- tmpi
+          (cast (parent   +^ layerNum)) <<- tmpv
+          f heapifyDown queue smallest
+        )
+    )
+  
+  heapifyUp <- l2VirtualFunc "heapifyUp"
+  l2SetRealFunc heapifyUp (\queue child -> do
+      parent <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      parent <<- (intcast queue) +^ ((child -^ (intcast queue) -^ layerNum) /^ (2 * 2 * layerNum) *^ (2 * layerNum) +^ layerNum)
+      l2IfElse ((parent >^ intcast queue) &^ (intcast (l2ComRef (cast parent)) >^ intcast (l2ComRef (cast child)))) (do
+          tmpi <- l2NewLocalVar
+          tmpv <- l2NewLocalVar
+          tmpi                          <<- l2ComRef (cast  child)
+          tmpv                          <<- l2ComRef (cast (child +^ layerNum))
+          (cast  child)                 <<- l2ComRef (cast  parent)
+          (cast (child +^ layerNum))    <<- l2ComRef (cast (parent   +^ layerNum))
+          (cast  parent        )        <<- tmpi
+          (cast (parent   +^ layerNum)) <<- tmpv
+          f heapifyUp queue parent
+        ) (nop)
+    )
+  
+  buildMinHeap <- l2VirtualFunc "buildMinHeap"
+  l2SetRealFunc buildMinHeap (\queue -> do
+      end <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      end <<- l2ComRef (unsafecast queue)
+      i   <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      i   <<- (((end -^ (intcast queue)) /^ (2 * 2 * layerNum) *^ (2 * layerNum)) -^ (1 * layerNum) +^ (intcast queue) )
+      l2While (i >^ intcast queue) (do
+          f heapifyDown (unsafecast queue) i :: ML2L Unit
+          i <<- i -^ (2 * layerNum)
+        )
+    )
+  
+  push <- l2VirtualFunc "push"
+  l2SetRealFunc push (\queue value priority -> do
+      newend <- l2NewLocalVar :: ML2L (L2LocalVariable Int)
+      newend <<- (l2ComRef (unsafecast queue)) +^ (layerNum * 2)
+      (unsafecast  newend)              <<- priority
+      (unsafecast (newend +^ layerNum)) <<- value
+      (unsafecast queue) <<- newend
+      f heapifyUp queue newend :: ML2L Unit
+    )
+  
+  pop <- l2VirtualFunc "pop"
+  l2SetRealFunc pop (\queue-> do
+      (unsafecast (intcast queue +^ (layerNum * 1))) <<- (l2ComRef (unsafecast ((intcast $ l2ComRef (unsafecast queue))                  )))
+      (unsafecast (intcast queue +^ (layerNum * 2))) <<- (l2ComRef (unsafecast ((intcast $ l2ComRef (unsafecast queue)) +^ (layerNum * 1))))
+      (unsafecast queue) <<- (l2ComRef (unsafecast queue)) -^ (layerNum * 2)
+      f heapifyDown queue (intcast queue +^ (layerNum * 1)) :: ML2L Unit
+    )
+  
+  getPriority <- l2VirtualFunc "getPriority"
+  l2SetRealFunc getPriority (\queue ->
+      l2ComRef (unsafecast (intcast queue +^ (layerNum * 1)))
+    )
+
+  getValue <- l2VirtualFunc "getValue"
+  l2SetRealFunc getValue (\queue ->
+      l2ComRef (unsafecast (intcast queue +^ (layerNum * 2)))
+    )
+
+  getLength <- l2VirtualFunc "getLength"
+  l2SetRealFunc getLength (\queue ->
+      ((intcast $ l2ComRef (unsafecast queue)) -^ (intcast queue) +^ layerNum) /^ (2 * layerNum)
+    )
+
+  hasElement <- l2VirtualFunc "hasElement"
+  l2SetRealFunc hasElement (\queue ->
+      (intcast queue) <^ (intcast $ l2ComRef (unsafecast queue))
+    )
+
+  empty <- l2VirtualFunc "empty"
+  l2SetRealFunc empty (\queue ->
+      (intcast queue) >^ (intcast $ l2ComRef (unsafecast queue))
+    )
+  
+  priorityAt <- l2VirtualFunc "priorityAt"
+  l2SetRealFunc priorityAt (\queue i ->
+      unsafecast $ intcast queue +^ ((i *^ 2) +^ 1) *^ layerNum
+    )
+  
+  valueAt <- l2VirtualFunc "valueAt"
+  l2SetRealFunc valueAt (\queue i ->
+      unsafecast $ intcast queue +^ ((i *^ 2) +^ 2) *^ layerNum
+    )
+  
+  pure {
+    new,
+    heapifyDown,
+    heapifyUp,
+    buildMinHeap,
+    push,
+    pop,
+    getPriority,
+    getValue,
+    getLength,
+    hasElement,
+    empty,
+    priorityAt,
+    valueAt
+  }
+
+
+data L2Arr a
+

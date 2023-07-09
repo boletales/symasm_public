@@ -1,0 +1,6 @@
+input: [c_1.repeat(n_1), ..., c_m.repeat(n_m)].join("")
+
+output: 
+    [c_1+str(n_1), c_m+str(n_m)].join("")
+  where
+    1. ∀i∈{1,...,n}. c_i is an alphabet

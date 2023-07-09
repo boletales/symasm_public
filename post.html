@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>codetest</title>
+    <style>
+        body {
+            font-family: Arial;
+        }
+        .dinput{
+            display: flex;
+            margin: 5px;
+        }
+        .linput{
+            margin-top: 10px;
+            margin-right: 10px;
+            width: 50px;
+            text-align: right;
+        }
+        .dcontrol{
+            margin-top: 10px;
+            margin-left: 10px;
+        }
+        .lnummode{
+            margin-right: 5px;
+        }
+        .tresult{
+            background-color: #eee;
+            color: #555;
+            border: solid 1px;
+            border-radius: 2px;
+        }
+        .dcontents{
+            display: flex;
+        }
+        .pproblem{
+            border: dashed 1px;
+            margin-top: 5px;
+            padding: 5px;
+        }
+        .pcode{
+            border: dashed 1px;
+            background-color: #eee;
+            margin-top: 5px;
+            padding: 5px;
+        }
+        .dpane{
+            margin: 10px;
+            box-shadow: 0px 0px 10px 0 #0002;
+            padding: 10px;
+            min-width: 500px;
+        }
+    </style>
+</head>
+<body>
+    <div class="dcontents">
+        <div class="dpane">
+            <div class="dinputs">
+                <div class="dinput">
+                    <label class="linput" for="tcode" >code: </label>
+                    <textarea id="tcode"    rows="10" cols="40"></textarea>
+                </div>
+                <div class="dinput">
+                    <label class="linput" for="tstdin">stdin:</label>
+                    <textarea id="tstdin" rows="10" cols="40"></textarea>
+                </div>
+            </div>
+            <div class="dcontrol">
+                <label class="lnummode" id="lnummode" for="cnummode">number mode:<input type="checkbox" id="cnummode"></label>
+                <input type="button" onclick="run();" id="brun" value="run">
+                <input type="button" onclick="submit();" id="bsubmit" value="submit" disabled>
+            </div>
+            <div class="dinput">
+                <textarea id="tresult" class="tresult" rows="5" cols="60" disabled></textarea>
+            </div>
+        </div>
+        <div class="dpane">
+            <select id="sproblems" onchange="select();">
+                <option>loading...</option>
+            </select>
+            <br>
+            <br>
+            <div id="dproblem">
+                <span class="ssample">problem : </span>
+                <pre class="pcode" id="pproblem"></pre>
+                <span class="ssample">sample_in : </span>
+                <pre class="pcode" id="psamplein"></pre>
+                <span class="ssample">sample_out : </span>
+                <pre class="pcode" id="psampleout"></pre>
+            </div>
+        </div>
+    </div>
+    <script>
+        const interpreter = "https://script.google.com/macros/s/AKfycbyWQ2vBq09Imy7kW7nHowEq8XSB1a6UgNxYcdENkc_nIBTiUm_XBwm5jQn0tk8zbQgJ/exec";
+        const judge       = "https://script.google.com/macros/s/AKfycbyuf5r0Bsdx0At0UX0jsmB-sYNw1oKaQ1J1OVr3BrbDLzeE--11bgLotST-nksKzG3-NQ/exec";
+        let tcode      = document.getElementById("tcode");
+        let tstdin     = document.getElementById("tstdin");
+        let tresult    = document.getElementById("tresult");
+        let cnummode   = document.getElementById("cnummode");
+        let brun       = document.getElementById("brun");
+        let bsubmit    = document.getElementById("bsubmit");
+        let sproblems  = document.getElementById("sproblems");
+        let dproblem   = document.getElementById("dproblem");
+        let pproblem   = document.getElementById("pproblem");
+        let psamplein  = document.getElementById("psamplein");
+        let psampleout = document.getElementById("psampleout");
+        function run(){
+            brun.disabled = true;
+            bsubmit.disabled = true;
+            tresult.value    = "wait...";
+            fetch(interpreter,
+                    {
+                        "method" : "POST",
+                        headers: {
+                        Accept: 'application/json',
+                        'Content-Type': 'text/plain',
+                        },
+                        "body"   : JSON.stringify({code:tcode.value, input:tstdin.value, nummode:cnummode.checked})
+                    })
+            .then( raw    => raw.json())
+            .then( result => tresult.value = result.log.join("\n"))
+            .finally(()=>{brun.disabled=false;bsubmit.disabled=false;});
+            
+        }
+
+        function submit(){
+            brun.disabled = true;
+            bsubmit.disabled = true;
+            tresult.value    = "judge...";
+            fetch(judge,
+                    {
+                        "method" : "POST",
+                        headers: {
+                        Accept: 'application/json',
+                        'Content-Type': 'text/plain',
+                        },
+                        "body"   : JSON.stringify({code:tcode.value, id:sproblems.value})
+                    })
+            .then( raw    => raw.json())
+            .then( result => tresult.value = "["+result.summary+"]\n\n"+ result.results.map((c,i) => "test " + (i+1) + "/" + result.results.length + " : " + "["+c+"]").join("\n"))
+            .finally(()=>{brun.disabled=false;bsubmit.disabled=false;});
+            
+        }
+
+        bsubmit.disabled = true;
+        let problemsCache = [];
+        fetch(judge,
+            {
+                "method" : "GET",
+                headers: {
+                Accept: 'application/json',
+                'Content-Type': 'text/plain',
+                }
+            }).then(raw=> raw.json()).then(_v=>{
+                let v = _v.concat();
+                v.sort((a,b)=> a.name > b.name ? 1 : -1);
+                sproblems.innerHTML = "";
+                v.forEach(e => {
+                    let opt = document.createElement("option");
+                    opt.appendChild(document.createTextNode(e.name));
+                    opt.value = e.name;
+                    sproblems.appendChild(opt);
+                });
+                problemsCache = v;
+                select();
+                bsubmit.disabled = false;
+            });
+        
+        function select(){
+            let problemData = problemsCache.find(e=>e.name == sproblems.value);
+            pproblem.innerText   = problemData.info + (problemData.nummode ? "\n\n(number mode)" : "");
+            psamplein.innerText  = problemData.samplein;
+            psampleout.innerText = problemData.sampleout;
+            cnummode.checked     = problemData.nummode;
+        }
+    </script>
+</body>
+</html>
